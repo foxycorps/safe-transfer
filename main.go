@@ -314,17 +314,49 @@ func orchestrator() {
 		}
 		fmt.Println("Device connected:", conn.RemoteAddr())
 		go func() {
-			filename := receiveFileListener(conn)
-			if filename != "" {
-				rcvConn, err := net.Dial("tcp", "localhost:"+ORCHESTRATOR_PORT)
-				if err != nil {
-					fmt.Println("Error connecting to receiver:", err)
-					return
-				}
-				sendFile(rcvConn, filename, ".")
+			defer conn.Close()
+			filenameBuffer := make([]byte, BUFFER_SIZE)
+			n, err := conn.Read(filenameBuffer)
+			if err != nil {
+				fmt.Println("Error reading filename:", err)
+				return
 			}
+			filename := strings.TrimSpace(string(filenameBuffer[:n]))
+			fmt.Printf("Received transfer request for file: %s\n", filename)
+
+			// Wait for the receiver
+			rcvConn, err := ln.Accept()
+			if err != nil {
+				fmt.Println("Error accepting receiver connection:", err)
+				return
+			}
+			fmt.Println("Receiver connected:", rcvConn.RemoteAddr())
+			relayData(conn, rcvConn, filename)
 		}()
 	}
+}
+
+// Relay data between sender and receiver
+func relayData(sender net.Conn, receiver net.Conn, filename string) {
+	defer receiver.Close()
+	buf := make([]byte, BUFFER_SIZE)
+	for {
+		n, err := sender.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			fmt.Println("Error reading from sender:", err)
+			return
+		}
+
+		_, err = receiver.Write(buf[:n])
+		if err != nil {
+			fmt.Println("Error writing to receiver:", err)
+			return
+		}
+	}
+	fmt.Printf("File %s relayed successfully.\n", filename)
 }
 
 // Sender function to send files or directories to the orchestrator
@@ -364,28 +396,13 @@ func sender(sourcePath string, orchestratorIP string) {
 }
 
 // Receiver function to accept incoming files
-func receiver(baseDir string) {
+func receiver(orchestratorIP string, baseDir string) {
 	baseDir = resolvePath(baseDir)
-	ln, err := tls.Listen("tcp", ":"+ORCHESTRATOR_PORT, &tls.Config{
-		Certificates: []tls.Certificate{serverCert},
-		ClientCAs:    caCertPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-	})
+	conn, err := net.Dial("tcp", orchestratorIP+":"+ORCHESTRATOR_PORT)
 	if err != nil {
-		panic("Error starting listener: " + err.Error())
+		panic("Error connecting to orchestrator: " + err.Error())
 	}
-	defer ln.Close()
-
-	fmt.Println("Receiver is running on port", ORCHESTRATOR_PORT)
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			fmt.Println("Error accepting connection:", err)
-			continue
-		}
-		go receiveFile(conn, baseDir)
-	}
+	receiveFile(conn, baseDir)
 }
 
 // Helper function to receive a file with authentication
@@ -466,11 +483,11 @@ func main() {
 		}
 		sender(*sourcePath, *orchestratorIP)
 	case "receive":
-		if *destDir == "" {
-			fmt.Println("Usage: -mode=receive -destDir=<destination_directory>")
+		if *destDir == "" || *orchestratorIP == "" {
+			fmt.Println("Usage: -mode=receive -destDir=<destination_directory> -orchestrator=<orchestrator_ip>")
 			return
 		}
-		receiver(*destDir)
+		receiver(*orchestratorIP, *destDir)
 	default:
 		fmt.Println("Invalid mode. Use one of: orchestrator, send, receive")
 	}
