@@ -2,10 +2,11 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
@@ -15,34 +16,36 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	mathrand "math/rand"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"compress/gzip"
 )
 
-const BUFFER_SIZE = 4096
+const (
+	BUFFER_SIZE        = 4096
+	HASH_SIZE          = 32    // SHA-256 size
+	DYNAMIC_PORT_START = 49152 // Dynamic port range starting port
+	DYNAMIC_PORT_END   = 65535 // Dynamic port range ending port
+)
 
 var (
 	privateKey *rsa.PrivateKey
 	publicKey  *rsa.PublicKey
 	serverCert tls.Certificate
 	caCertPool *x509.CertPool
-	startPort  = 49152            // Dynamic port range starting port
-	endPort    = 65535            // Dynamic port range ending port
 	secretKey  = make([]byte, 32) // AES-256 key
 )
 
 func init() {
-	_, err := rand.Read(secretKey)
+	_, err := cryptorand.Read(secretKey)
 	if err != nil {
 		panic(err)
 	}
 	// Generate an RSA key pair
-	privateKey, err = rsa.GenerateKey(rand.Reader, 2048)
+	privateKey, err = rsa.GenerateKey(cryptorand.Reader, 2048)
 	if err != nil {
 		panic(err)
 	}
@@ -52,7 +55,7 @@ func init() {
 
 // Helper function to generate a self-signed certificate for TLS
 func generateSelfSignedCert() {
-	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	priv, _ := rsa.GenerateKey(cryptorand.Reader, 2048)
 	cert := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
@@ -64,7 +67,7 @@ func generateSelfSignedCert() {
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 
-	certBytes, _ := x509.CreateCertificate(rand.Reader, cert, cert, &priv.PublicKey, priv)
+	certBytes, _ := x509.CreateCertificate(cryptorand.Reader, cert, cert, &priv.PublicKey, priv)
 	serverCert = tls.Certificate{
 		Certificate: [][]byte{certBytes},
 		PrivateKey:  priv,
@@ -87,7 +90,7 @@ func encrypt(data []byte) ([]byte, error) {
 	}
 
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+	if _, err = io.ReadFull(cryptorand.Reader, nonce); err != nil {
 		return nil, err
 	}
 
@@ -145,7 +148,7 @@ func decompress(data []byte) ([]byte, error) {
 }
 
 func getDynamicPort() string {
-	port := rand.Intn(endPort-startPort) + startPort
+	port := mathrand.Intn(DYNAMIC_PORT_END-DYNAMIC_PORT_START) + DYNAMIC_PORT_START
 	return fmt.Sprintf("%d", port)
 }
 
@@ -200,7 +203,7 @@ func sendFile(conn net.Conn, path string, baseDir string) {
 		conn.Write(append(encryptedData, hmacSignature...))
 
 		// Add random delay to avoid detection via traffic analysis
-		time.Sleep(time.Millisecond * time.Duration(rand.Intn(100)))
+		time.Sleep(time.Millisecond * time.Duration(mathrand.Intn(100)))
 	}
 	fmt.Println("File sent successfully:", relPath)
 }
@@ -242,8 +245,8 @@ func receiveFile(conn net.Conn, baseDir string) {
 		}
 
 		// Separate HMAC signature from data
-		data := buf[:n-len(sha256.New().Size())]
-		expectedHMAC := buf[n-len(sha256.New().Size()):]
+		data := buf[:n-HASH_SIZE]
+		expectedHMAC := buf[n-HASH_SIZE:]
 
 		// Verify HMAC signature
 		h := hmac.New(sha256.New, secretKey)
@@ -270,7 +273,7 @@ func receiveFile(conn net.Conn, baseDir string) {
 		outFile.Write(decompressedData)
 
 		// Add random delay to avoid detection via traffic analysis
-		time.Sleep(time.Millisecond * time.Duration(rand.Intn(100)))
+		time.Sleep(time.Millisecond * time.Duration(mathrand.Intn(100)))
 	}
 	fmt.Println("File received successfully:", fullPath)
 }
@@ -299,7 +302,7 @@ func orchestrator() {
 		go func() {
 			filename := receiveFileListener(conn)
 			if filename != "" {
-				rcvConn, err := net.Dial("tcp", "localhost:"+FILE_INFO_PORT)
+				rcvConn, err := net.Dial("tcp", "localhost:"+getDynamicPort())
 				if err != nil {
 					fmt.Println("Error connecting to receiver:", err)
 					return
@@ -324,7 +327,7 @@ func sender(sourcePath string, orchestratorIP string) {
 			}
 
 			if !info.IsDir() {
-				conn, err := net.Dial("tcp", orchestratorIP+":"+ORCHESTRATOR_PORT)
+				conn, err := net.Dial("tcp", orchestratorIP+":"+getDynamicPort())
 				if err != nil {
 					fmt.Println("Error connecting to orchestrator:", err)
 					return err
@@ -337,7 +340,7 @@ func sender(sourcePath string, orchestratorIP string) {
 			fmt.Println("Error walking through the directory:", err)
 		}
 	} else {
-		conn, err := net.Dial("tcp", orchestratorIP+":"+ORCHESTRATOR_PORT)
+		conn, err := net.Dial("tcp", orchestratorIP+":"+getDynamicPort())
 		if err != nil {
 			panic("Error connecting to orchestrator: " + err.Error())
 		}
@@ -400,8 +403,8 @@ func receiveFileListener(conn net.Conn) string {
 		}
 
 		// Separate HMAC signature from data
-		data := buf[:n-len(sha256.New().Size())]
-		expectedHMAC := buf[n-len(sha256.New().Size()):]
+		data := buf[:n-HASH_SIZE]
+		expectedHMAC := buf[n-HASH_SIZE:]
 
 		// Verify HMAC signature
 		h := hmac.New(sha256.New, secretKey)
