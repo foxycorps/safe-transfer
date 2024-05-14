@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -25,10 +26,9 @@ import (
 )
 
 const (
-	BUFFER_SIZE        = 4096
-	HASH_SIZE          = 32    // SHA-256 size
-	DYNAMIC_PORT_START = 49152 // Dynamic port range starting port
-	DYNAMIC_PORT_END   = 65535 // Dynamic port range ending port
+	BUFFER_SIZE       = 4096
+	HASH_SIZE         = 32      // SHA-256 size
+	ORCHESTRATOR_PORT = "54321" // Fixed port for the orchestrator
 )
 
 var (
@@ -147,9 +147,16 @@ func decompress(data []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func getDynamicPort() string {
-	port := mathrand.Intn(DYNAMIC_PORT_END-DYNAMIC_PORT_START) + DYNAMIC_PORT_START
-	return fmt.Sprintf("%d", port)
+// Resolve `~` to user's home directory
+func resolvePath(p string) string {
+	if strings.HasPrefix(p, "~/") {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			panic(err)
+		}
+		return filepath.Join(homeDir, p[2:])
+	}
+	return p
 }
 
 // Send a file with encryption, compression, and authentication
@@ -162,7 +169,11 @@ func sendFile(conn net.Conn, path string, baseDir string) {
 		return
 	}
 
-	conn.Write([]byte(relPath + "\n"))
+	_, err = conn.Write([]byte(relPath + "\n"))
+	if err != nil {
+		fmt.Println("Error sending file name:", err)
+		return
+	}
 
 	inFile, err := os.Open(path)
 	if err != nil {
@@ -200,12 +211,16 @@ func sendFile(conn net.Conn, path string, baseDir string) {
 		h.Write(encryptedData)
 		hmacSignature := h.Sum(nil)
 
-		conn.Write(append(encryptedData, hmacSignature...))
+		_, err = conn.Write(append(encryptedData, hmacSignature...))
+		if err != nil {
+			fmt.Println("Error sending file data:", err)
+			continue
+		}
 
 		// Add random delay to avoid detection via traffic analysis
 		time.Sleep(time.Millisecond * time.Duration(mathrand.Intn(100)))
 	}
-	fmt.Println("File sent successfully:", relPath)
+	fmt.Printf("File sent successfully: %s\n", relPath)
 }
 
 // Receive a file with decryption, decompression, and authentication
@@ -275,13 +290,12 @@ func receiveFile(conn net.Conn, baseDir string) {
 		// Add random delay to avoid detection via traffic analysis
 		time.Sleep(time.Millisecond * time.Duration(mathrand.Intn(100)))
 	}
-	fmt.Println("File received successfully:", fullPath)
+	fmt.Printf("File received successfully: %s\n", fullPath)
 }
 
 // Orchestrator function to manage connections between sender and receiver
 func orchestrator() {
-	port := getDynamicPort()
-	ln, err := tls.Listen("tcp", ":"+port, &tls.Config{
+	ln, err := tls.Listen("tcp", ":"+ORCHESTRATOR_PORT, &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 		ClientCAs:    caCertPool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
@@ -291,7 +305,7 @@ func orchestrator() {
 	}
 	defer ln.Close()
 
-	fmt.Println("Orchestrator is running on port", port)
+	fmt.Println("Orchestrator is running on port", ORCHESTRATOR_PORT)
 
 	for {
 		conn, err := ln.Accept()
@@ -299,10 +313,11 @@ func orchestrator() {
 			fmt.Println("Error accepting connection:", err)
 			continue
 		}
+		fmt.Println("Device connected:", conn.RemoteAddr())
 		go func() {
 			filename := receiveFileListener(conn)
 			if filename != "" {
-				rcvConn, err := net.Dial("tcp", "localhost:"+getDynamicPort())
+				rcvConn, err := net.Dial("tcp", "localhost:"+ORCHESTRATOR_PORT)
 				if err != nil {
 					fmt.Println("Error connecting to receiver:", err)
 					return
@@ -315,6 +330,7 @@ func orchestrator() {
 
 // Sender function to send files or directories to the orchestrator
 func sender(sourcePath string, orchestratorIP string) {
+	sourcePath = resolvePath(sourcePath)
 	fileInfo, err := os.Stat(sourcePath)
 	if err != nil {
 		panic("Error getting file info: " + err.Error())
@@ -327,7 +343,7 @@ func sender(sourcePath string, orchestratorIP string) {
 			}
 
 			if !info.IsDir() {
-				conn, err := net.Dial("tcp", orchestratorIP+":"+getDynamicPort())
+				conn, err := net.Dial("tcp", orchestratorIP+":"+ORCHESTRATOR_PORT)
 				if err != nil {
 					fmt.Println("Error connecting to orchestrator:", err)
 					return err
@@ -340,7 +356,7 @@ func sender(sourcePath string, orchestratorIP string) {
 			fmt.Println("Error walking through the directory:", err)
 		}
 	} else {
-		conn, err := net.Dial("tcp", orchestratorIP+":"+getDynamicPort())
+		conn, err := net.Dial("tcp", orchestratorIP+":"+ORCHESTRATOR_PORT)
 		if err != nil {
 			panic("Error connecting to orchestrator: " + err.Error())
 		}
@@ -350,8 +366,8 @@ func sender(sourcePath string, orchestratorIP string) {
 
 // Receiver function to accept incoming files
 func receiver(baseDir string) {
-	port := getDynamicPort()
-	ln, err := tls.Listen("tcp", ":"+port, &tls.Config{
+	baseDir = resolvePath(baseDir)
+	ln, err := tls.Listen("tcp", ":"+ORCHESTRATOR_PORT, &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 		ClientCAs:    caCertPool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
@@ -361,7 +377,7 @@ func receiver(baseDir string) {
 	}
 	defer ln.Close()
 
-	fmt.Println("Receiver is running on port", port)
+	fmt.Println("Receiver is running on port", ORCHESTRATOR_PORT)
 
 	for {
 		conn, err := ln.Accept()
